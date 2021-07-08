@@ -1,0 +1,294 @@
+High Availability Vault with DynamoDB in Kubernetes
+21 Feb 2019
+Tags: foo, bar, baz
+
+Vinh Nguyen
+Founder, noty.im
+vinh@axcoto.com
+https://betterdev.link
+@kureikain
+
+
+* About me
+
+DevOps enginner, Founder, Junk collector.
+
+
+.link http://noty.im noty.im: uptime monitoring
+.link http://betterdev.link betterdev.link: weekly links on programing, devops
+.link https://github.com/v9n github.com/v9n
+
+* Why Vault?
+
+- Microservice
+- Centralization
+- Nice UI
+- Multiple method to do authentication for dev(interactive) and app(no interaction)
+
+
+* Why Kubernetes(K8S)
+
+K8S/Docker solves lot of problem. They have their pain points but imagine life before K8S.
+
+- Faster to deploy anything
+- Easier to populate config/env
+- Everything is YAML!!!
+
+* 12factor app
+
+Use environment variable to configure your app or pass the secret
+
+* K8S Built-in methods
+
+Configmap and Secret
+
+Both are interchangeable and very flexible as in you can even mount the key as a file or directory into pod
+
+(Some api, especially google, need a JSON file for credential)
+
+* Challenge
+
+How do we get them into k8s
+
+- Secret isn't secure(for now): just base64
+- Messy yaml files with all k8s secret mapping
+- Duplicate yaml for QA/Prod/Staging
+- Secret are namespace: cannot cross mount lead to duplicate secrets
+- Very hard to run `kubectl apply` since you may override manually added item.
+
+* Best practices
+
+- Make it staless!!!
+  By moving secret out of k8s, we are worry free about our yaml
+
+- Keep it simple: the less component the better
+
+* Reduce YAML madness
+
+A single yaml can be used for all environment
+
+Consider putting any configuration into Vault not just secret
+
+* High Availability
+
+The availability of our system depend on the least availability component
+
+- Vault is a dependency during application booting
+- Maybe even a runtime dependency
+
+* High Availability
+
+We need:
+
+- High uptime
+- Faster recovery time: either due to computer or human error
+- Auto healing
+
+* High Availability
+
+Vault depends on availability of its storage and unseal method.
+
+- Only Consul is the official support storage
+- Consul is another system to manage
+- Community Supported storage does undergone review by HashiCorp employees
+
+https://medium.com/@daniel.p.woods/on-infrastructure-at-scale-a-cascading-failure-of-distributed-systems-7cff2a3cd2df
+
+* Auto unseal with KMS
+
+K8S pods come and gone all the time: k8s update, resource schedule.
+
+KMS is easy to use and secure. And AWS managed it for you.
+
+Easily to integrate by using IAM role attach to your instance or kube2iam
+
+Or by using config block:
+
+  seal "awskms" {
+    region     = "us-east-1"
+    access_key = "AKIAIOSFODNN7EXAMPLE"
+    secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    kms_key_id = "19ec80b0-dfdd-4d97-8164-c6examplekey"
+  }
+
+* Vault storage with DynamoDB
+
+Vault DynamoDB storage supports HA mode
+
+- AWS managed it for us
+- Cross region replication in multi-master mode
+- Scale very well as long as you design it carefully to avoid hotshard
+
+    storage "dynamodb" {
+      ha_enabled = "true"
+      region     = "us-east-2"
+      table      = "example-201902"
+    }
+
+* Secret V2
+
+You should enable it. Not enable by default at this momnent.
+
+- It supports revision or history
+
+- Can be undeleted
+
+* Tuning DynamoDB
+
+DynamoDB has its own best practices, especially on read/write capacity
+
+- Use On-Demand pricing at first
+- Enable Global Table
+- Enable backup: incremental backups of your table for the last 35 days
+
+
+* K8S Deployment
+
+Service
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: vault
+    namespace: kube-system
+  spec:
+    clusterIP: None
+    ports:
+      - name: http
+        port: 8200
+      - name: server
+        port: 8201
+    selector:
+      app: vault
+
+* K8S Deployment
+
+Statefulset
+
+- Allow you to control how to rollout
+- Static pod name
+
+Using configmap to inject Vault config
+
+  containers:
+    - name: vault
+      image: "vault:1.0.0"
+      volumeMounts:
+        - name: vault-config
+          mountPath: /etc/vault/config
+      env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: "status.podIP"
+        - name: "VAULT_CLUSTER_ADDR"
+          value: "https://$(POD_IP):8201"
+  volumes:
+    - name: vault-config
+      configMap:
+        name: vault-config
+
+`POD_IP` and `VAULT_CLUSTER_ADDR` is important here
+
+* K8S Deployment
+
+A dedicated instance group to run only Vault
+
+- No process run on same server with Vault
+- Prevent OOM
+
+* App Authentication
+
+Use K8S role for pod with kubernetes authentication
+
+- Create k8s service account and configure pod to use it
+
+  vault write auth/kubernetes/role/demo \
+      bound_service_account_names=vault-auth \
+      bound_service_account_namespaces=default \
+      policies=default \
+      ttl=1h
+
+* App Authentication
+
+- Bind service account to a vault role and policies
+
+  apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: vault-demo
+
+Set pod to use that serviceaccount:
+
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: my-pod
+  spec:
+    serviceAccountName: vault-demo
+
+jwt is at `/var/run/secrets/tokens`
+
+* Inject secret into pods
+
+Keep it simple as much as possible
+
+Less components mean less thing to worry about
+
+- You don't need yet another operator
+- init container is awesome
+
+  copy vault cli, ca cert, vault wrapper script to login to vault and export var
+- entrypoint is awesome
+
+  cmd -> entrypoint
+  args -> command
+
+
+* Dev Authentication
+
+Use username/password with Duo MFA for dev access
+
+Despite it being deprecate, I have used it and work very well
+
+* TLS/PKI
+
+Pod need CA cert to talk to Vault
+
+https://github.com/cloudflare/cfssl makes it easy
+https://github.com/kelseyhightower/vault-on-google-kubernetes-engine has some example to use cfssl
+
+Monitor and automate your cert renewal.
+
+* Disaster recovery
+
+Accidently delete thing? DynamoDB saves us.
+
+- Restore to any time withint 35 days
+- Update config map to use this new DynamoDB table
+
+* Automate restore db
+
+You absolutely has to automate this process.
+
+1. Input a given time
+2. Restore DynamoDB
+3. Polling until it's ready
+4. Upgrade configmap to point to the new table
+5. Restart vault
+
+* Practice
+
+Gitlab were down and none of backup works.
+
+Make this process routine
+
+Restore to a new dynamodb and switch to it every 3 month automatically
+
+The more often you do it the more confident you have
+
+
+* Thank you
+
+Question/Feedback
+vinh@axcoto.com
